@@ -8,7 +8,7 @@ function on_exit() {
 }
 
 function usage() {
-    echo "mkcbundle [args]"
+    echo "mkccvenv [args]"
     echo
     echo "Valid args:"
     echo " -p <profile>    use a specific profile directory"
@@ -44,7 +44,7 @@ if [ ! -f ${PROFILE}/manifest.txt ]; then
     exit 1
 fi
 
-TEMPDIR=$(mktemp -d --tmpdir bundler-XXXXXXXXXXX)
+TEMPDIR=$(mktemp -d --tmpdir cvenv-XXXXXXXXXXX)
 # trap on_exit exit
 
 OLD_PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}

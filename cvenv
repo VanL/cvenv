@@ -1,0 +1,616 @@
+#!/bin/bash
+
+set -e
+set -u
+
+shopt -s nullglob
+
+function on_exit() {
+    [ -e ${TEMPDIR} ] && rm -rf ${TEMPDIR}
+}
+
+ROOT_PATH=/opt/cvenv
+RESTART_SERVICES=1
+FORCE=0
+TEMPDIR=$(mktemp -d --tmpdir cvenv-XXXXXX)
+
+trap on_exit exit
+
+function log() {
+    echo "$@" >&2
+}
+
+function usage() {
+    echo "cvenv [args] <action> <action args>"
+    echo
+    echo "Valid Options:"
+    echo " -h               help"
+    echo " -f               force overwrite or removal of files"
+    echo " -r <path>        root path to install/uninstall to/from"
+    echo
+    echo "Valid Actions:"
+    echo " install                       install a cvenv file"
+    echo " uninstall                     uninstall a cvenv name"
+    echo " upgrade                       install and set a cvenv active"
+    echo " activate <cvenv> <version>   activate a cvenv version"
+    echo " list                          list cvenvs"
+    echo " list <cvenv name>            list installed version of cvenv"
+}
+
+function cvenv_from_file() {
+    # $1 - file name
+    local file_name=$(basename "$1")
+    local cvenv_name
+
+    cvenv_name="${file_name%-*}"
+    echo "${cvenv_name}"
+}
+
+function version_from_file() {
+    # $1 - file name
+    local file_name=$(basename "$1")
+    local cvenv_version
+    local cvenv_name=$(cvenv_from_file "${file_name}")
+
+    cvenv_version=$(basename "${file_name#${cvenv_name}-}" .tar.gz)
+
+    echo ${cvenv_version}
+}
+
+function template_copy() {
+    # $1 cvenv name
+    # $2 cvenv version
+    # $3 relative path
+    # $4 destination path
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local relative_path=$3
+    local destination_path=$4
+
+    local base_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    cp "${base_dir}/${relative_path}" "${destination_path}"
+    sed -i "${destination_path}" -e "s~@BUNDLE_BIN@~${base_dir}/bin~"
+}
+
+function cvenv_installed() {
+    # $1 cvenv name
+    local cvenv_name=$1
+
+    if [ -L "${ROOT_PATH}/${cvenv_name}/current" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+function is_current_version() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name="$1"
+    local cvenv_version="$2"
+    local current_version=$(find_current_cvenv_version "${cvenv_name}")
+
+    if [ "${current_version}" = "${cvenv_version}" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+function find_current_cvenv_version() {
+    # $1 cvenv name
+    local cvenv_name=$1
+    local cvenv_version="unknown"
+
+    if ! cvenv_installed "${cvenv_name}"; then
+        echo "Bundle not installed"
+        exit 1
+    fi
+
+    if [ -L "${ROOT_PATH}/${cvenv_name}/current" ]; then
+        cvenv_version=$(version_from_file $(readlink -f "${ROOT_PATH}/${cvenv_name}/current"))
+    fi
+
+    echo "${cvenv_version}"
+}
+
+function find_basedir() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local real_version
+
+    if [ "${cvenv_version}" == "current" ]; then
+        real_version=$(find_current_cvenv_version "${cvenv_name}")
+        if [ ${real_version} == "unknown" ]; then
+            echo "No 'current' symlink'"
+            exit 1
+        fi
+
+        echo "${ROOT_PATH}/${cvenv_name}/${cvenv_name}-${real_version}"
+    else
+        echo "${ROOT_PATH}/${cvenv_name}/${cvenv_name}-${cvenv_version}"
+    fi
+}
+
+function cvenv_remove_unchanged_templated_files() {
+    # $1 - cvenv name
+    # $2 - version
+    # $3 - relative dir
+    # $4 - dest dir
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local relative_dir=$3
+    local dest_dir=$4
+
+    local cvenv_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    if [ -d "${cvenv_dir}/${relative_dir}" ]; then
+        log "Removing unchanged files in ${dest_dir} for ${cvenv_name} (${cvenv_version})"
+
+        pushd "${cvenv_dir}/${relative_dir}" > /dev/null 2>&1
+        for xfile in $(find . -type f); do
+            xfile=$(echo "${xfile}" | cut -c3-)
+
+            if [ -e "${dest_dir}/${xfile}" ]; then
+                template_copy "${cvenv_name}" "${cvenv_version}" "${relative_dir}/${xfile}" "${TEMPDIR}/xfile"
+                local old_md5=$(md5sum "${TEMPDIR}/xfile" | awk '{ print $1 }')
+                local new_md5=$(md5sum "${dest_dir}/${xfile}" | awk '{ print $1 }')
+
+                if [ $FORCE -eq 1 ] || [ "${old_md5}" == "${new_md5}" ]; then
+                    log " - Removing '${xfile}'"                    
+                    rm -f "${TEMPDIR}/xfile" "${dest_dir}/${xfile}"
+                else
+                    log " - Keeping locally modified file '${dest_dir}/${xfile}'"
+                fi
+            fi
+        done
+        popd > /dev/null 2>&1
+    else
+        log "No files to remove in ${dest_dir} for ${cvenv_name} (${cvenv_version})"
+    fi
+}
+
+function cvenv_remove_etc() {
+    # $1 - cvenv name
+    # $2 - version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+
+    cvenv_remove_unchanged_templated_files "$1" "$2" "etc" "/etc"
+}
+
+function cvenv_remove_init() {
+    # $1 - cvenv name
+    # $2 - version
+    
+    local cvenv_name=$1
+    local cvenv_version=$2
+
+    cvenv_remove_unchanged_templated_files "$1" "$2" "init" "/etc/init.d"
+}
+
+function cvenv_remove_binlinks() {
+    # $1 - cvenv name
+    # $2 - version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local cvenv_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    log "Removing symlinked binfiles"
+
+    for file in "${cvenv_dir}"/bin/*; do
+        if [ -x "${file}" ]; then
+            if [ -L "/bin/$(basename ${file})" ]; then
+                log " - $(basename ${file})"
+                rm "/bin/$(basename ${file})"
+            fi
+        fi
+    done
+}
+
+function cvenv_rpathize() {
+    # $1 - cvenv name
+    # $2 - version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local cvenv_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    for dir in bin lib; do
+        log "Performing rpath fixups in /${dir}"
+        for file in "${cvenv_dir}"/${dir}/*; do
+            if $(file -b ${file} | grep -q "ELF" > /dev/null 2>&1); then
+                log " - Fixing $(basename ${file})"
+                patchelf --set-rpath "${cvenv_dir}/lib" "${file}"
+            fi
+        done
+    done
+}
+
+function cvenv_install_templated_files() {
+    # $1 - cvenv name
+    # $2 - version
+    # $3 - relative dir
+    # $4 - dest dir
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local relative_dir=$3
+    local dest_dir=$4
+
+    local cvenv_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    if [ -d "${cvenv_dir}/${relative_dir}" ]; then
+        log "Installing files in ${dest_dir} for ${cvenv_name} (${cvenv_version})"
+
+        pushd "${cvenv_dir}/${relative_dir}" > /dev/null 2>&1
+        for xfile in $(find . -type f); do
+            xfile=$(echo "${xfile}" | cut -c3-)
+
+            if [ $FORCE -eq 1 ] || [ ! -e "${dest_dir}/${xfile}" ]; then
+                log " - Installing '${xfile}'"
+                template_copy "${cvenv_name}" "${cvenv_version}" "${relative_dir}/${xfile}" "${TEMPDIR}/xfile"
+                mkdir -p $(dirname "${dest_dir}/${xfile}")
+                cp "${TEMPDIR}/xfile" "${dest_dir}/${xfile}"
+            else
+                log " - Skipping '${xfile}'"
+            fi
+        done
+        popd > /dev/null 2>&1
+    else
+        log "No files to install in ${dest_dir} for ${cvenv_name} (${cvenv_version})"
+    fi
+}
+
+function cvenv_install_etc() {
+    # $1 - cvenv name
+    # $2 - version
+
+    cvenv_install_templated_files "$1" "$2" "etc" "/etc"
+}
+
+function cvenv_install_init() {
+    # $1 - cvenv name
+    # $2 - version
+ 
+    cvenv_install_templated_files "$1" "$2" "init" "/etc/init.d"
+}
+
+function cvenv_install_binlinks() {
+    # $1 - cvenv name
+    # $2 - version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local cvenv_dir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+
+    log "Installing symlinked binfiles"
+
+    for file in "${cvenv_dir}"/bin/*; do
+        if [ -x "${file}" ]; then
+            local destfile="/bin/$(basename ${file})"
+
+            log " - ${file} -> ${destfile}"
+            rm -f "${destfile}"
+            ln -s "${file}" "${destfile}"
+        fi
+    done
+}
+
+function cvenv_deactivate() {
+    # $1 cvenv_name
+    # $2 cvenv_verson
+
+    local cvenv_name="$1"
+    local cvenv_version="$2"
+
+    if cvenv_installed "${cvenv_name}"; then
+        if is_current_version "${cvenv_name}" "${cvenv_version}"; then
+            if [ ${RESTART_SERVICES} -eq 1 ]; then
+                cvenv_stop "${cvenv_name}" "${cvenv_version}"
+            fi
+            cvenv_remove_init "${cvenv_name}" "${cvenv_version}"
+            cvenv_remove_etc "${cvenv_name}" "${cvenv_version}"
+            cvenv_remove_binlinks "${cvenv_name}" "${cvenv_version}"
+        fi
+    fi
+}
+
+
+function cvenv_deactivate_current() {
+    # $1 cvenv_name
+    
+    local cvenv_name="$1"
+    local cvenv_version=$(find_current_cvenv_version "${cvenv_name}")
+
+    if [ "${cvenv_version}" != "unknown" ]; then
+        cvenv_deactivate "${cvenv_name}" "${cvenv_version}"
+    fi
+}
+
+function cvenv_activate() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name="$1"
+    local cvenv_version="$2"
+
+    cvenv_install_init "${cvenv_name}" "${cvenv_version}"
+    cvenv_install_etc "${cvenv_name}" "${cvenv_version}"
+    cvenv_install_binlinks "${cvenv_name}" "${cvenv_version}"
+
+    if [ ${RESTART_SERVICES} -eq 1 ]; then
+        cvenv_start "${cvenv_name}" "${cvenv_version}"
+    fi
+}
+
+function install_cvenv_from_file() {
+    # $1 file_name
+    local file_name="$1"
+
+    local cvenv_name
+    local cvenv_version
+
+    cvenv_name=$(cvenv_from_file "${file_name}")
+    cvenv_version=$(version_from_file "${file_name}")
+
+    # uninstall old
+    if cvenv_installed "${cvenv_name}"; then
+        cvenv_deactivate_current "${cvenv_name}"
+    fi
+
+    # unarchive the new cvenv
+    log "Extracting cvenv"
+    mkdir -p "${ROOT_PATH}/${cvenv_name}"
+    tar -C "${ROOT_PATH}/${cvenv_name}" -xzf "${file_name}" > /dev/null 2>&1
+
+    
+    # move current
+    cvenv_set_current "${cvenv_name}" "${cvenv_version}"
+
+    # fix up and go
+    cvenv_rpathize "${cvenv_name}" "current"
+    cvenv_activate "${cvenv_name}" "${cvenv_version}"
+}
+
+function cvenv_set_current() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name="$1"
+    local cvenv_version="$2"
+    
+    rm -f "${ROOT_PATH}/${cvenv_name}/current"
+    ln -s "${ROOT_PATH}/${cvenv_name}/${cvenv_name}-${cvenv_version}" "${ROOT_PATH}/${cvenv_name}/current"
+}
+
+function cvenv_stop() {
+    # $1 cvenv name
+    # $2 cvenv version
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local cvenv_path=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+    local script
+
+    # try and kill, but don't freak if we can't
+    # ls ${cvenv_path}/init/*
+
+    set +e
+    for script in "${cvenv_path}"/init/*; do
+        log " - Stopping service '${script}'"
+        service $(basename "${script}") stop
+    done
+    set -e
+}
+
+function cvenv_stop_current() {
+    # $1 cvenv name
+    local cvenv_name=$1
+
+    cvenv_stop "${cvenv_name}" "current"
+}
+
+function cvenv_start() {
+    # $1 cvenv name
+    # $2 cvenv version
+    local cvenv_name=$1
+    local cvenv_version=$2
+    local cvenv_path=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+    local script
+
+    # try and kill, but don't freak if we can't
+    set +e
+    for script in "${cvenv_path}"/init/*; do
+        log " - Starting service '${script}'"
+        service $(basename "${script}") start
+    done
+    set -e
+}
+
+function cvenv_start_current() {
+    # $1 cvenv name
+    local cvenv_name=$1
+
+    cvenv_start "${cvenv_name}" "current"
+}
+
+function cvenv_uninstall_version() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name=$1
+    local cvenv_version=$2
+
+    if is_current_version "${cvenv_name}" "${cvenv_version}"; then
+        echo "Cannot uninstall current version.  Make another active first"
+        exit 1
+    fi
+
+    local basedir=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+    if [ -d "${basedir}" ]; then
+        rm -rf "${basedir}" > /dev/null 2>&1
+    fi
+}
+
+
+function main_uninstall() {
+    # $1 cvenv name
+    # $2 cvenv version
+
+    local cvenv_name="$1"
+    local cvenv_version="${2:-}"
+
+    if ! cvenv_installed "${cvenv_name}"; then
+        echo "Bundle '${cvenv_name}' not installed"
+        exit 1
+    fi
+
+    if [ "${cvenv_version}" = "" ]; then
+        # uninstall entire cvenv...
+        if [ ${FORCE} -ne 1 ]; then
+            echo "Cannot delete entire cvenv without force (-f)"
+            exit 1
+        fi
+
+        cvenv_deactivate_current "${cvenv_name}"
+        rm -rf "${ROOT_PATH}/${cvenv_name}"
+    else
+        if is_current_version "${cvenv_name}" "${cvenv_version}"; then
+            echo "Cannot uninstall current without deleting entire cvenv"
+            exit 1
+        fi
+
+        local cvenv_path=$(find_basedir "${cvenv_name}" "${cvenv_version}")
+        if [ ! -d "${cvenv_path}" ]; then
+            echo "Bundle version does not exist"
+            exit 1
+        fi
+
+        rm -rf "${cvenv_path}"
+    fi
+}
+
+function main_list() {
+    # $1 maybe cvenv name
+    local cvenv_name=${1:-}
+
+    if [ "${cvenv_name}" == "" ]; then
+        if [ ! -d ${ROOT_PATH} ]; then
+            echo "No cvenvs found"
+        else
+            echo "Installed cvenvs:"
+            for cvenv in "${ROOT_PATH}"/*; do
+                cvenv_name=$(basename "${cvenv}")
+                echo " ${cvenv_name} ($(find_current_cvenv_version $(basename "${cvenv}")))"
+            done
+        fi
+    else
+        if ! cvenv_installed "${cvenv_name}"; then
+            echo "Bundle '${cvenv_name}' not installed"
+        else
+            echo "Installed versions:"
+
+            local current_version=$(find_current_cvenv_version "${cvenv_name}")
+
+            for cvenv in "${ROOT_PATH}/${cvenv_name}"/*; do
+                if [ "${cvenv}" != "current" ]; then
+                    local cvenv_verify=$(cvenv_from_file "${cvenv}")
+                    local cvenv_version=$(version_from_file "${cvenv}")
+
+                    if [ "${cvenv_verify}" = "${cvenv_name}" ]; then
+                        annotate=""
+                        if [ "${cvenv_version}" = "${current_version}" ]; then
+                            annotate="*"
+                        fi
+                            
+                        echo " ${cvenv_version} ${annotate}"
+                    fi
+                fi
+            done
+        fi
+    fi
+}
+
+function main_activate() {
+    # $1 - cvenv name
+    # $2 - cvenv version
+
+    local cvenv_name=${1:-}
+    local cvenv_version=${2:-}
+
+    if [ -z "${cvenv_name}" ] || [ -z "${cvenv_version}" ]; then
+        echo "No cvenv name, or no cvenv version"
+        usage
+        exit 1
+    fi
+
+    cvenv_deactivate_current "${cvenv_name}"
+    cvenv_set_current "${cvenv_name}" "${cvenv_version}"
+    cvenv_activate "${cvenv_name}" "${cvenv_version}"
+}
+
+function main_install() {
+    # $1 - file name
+    local file_name=$1
+
+    # if it is a http url, pull the file using wget
+    if [[ "${file_name}" =~ "http://" ]] || [[ "${file_name}" =~ "ftp://" ]]; then
+        # pull the file down
+        local outfile=${TEMPDIR}/$(basename "${file_name}")
+        wget "${file_name}" -q -O "${outfile}"
+        file_name=${outfile}
+
+        if [ ! -f "${file_name}" ]; then
+            echo "Could not download file"
+            exit 1
+        fi
+
+        echo "Downloaded files"
+    fi
+
+    cvenv_name=$(cvenv_from_file "$file_name")
+    cvenv_version=$(version_from_file "$file_name")
+
+    echo "working with cvenv ${cvenv_name} version ${cvenv_version}"
+
+    install_cvenv_from_file ${file_name}
+
+while getopts "hr:f" OPTION; do
+    case ${OPTION} in
+        h)
+            usage
+            exit 0
+            ;;
+        r)
+            ROOT_PATH=${OPTARG}
+            ;;
+        f)
+            FORCE=1
+            ;;
+        ?)
+            usage
+            exit 1
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+ACTION=${1:-help}
+shift
+
+if ( type main_${ACTION,,} | grep -q "is a function" ); then
+    main_${ACTION,,} "$@"
+else
+    echo "Invalid action: ${ACTION}"
+fi
+
+

@@ -1,11 +1,11 @@
-PROJECT=cbundler
+PROJECT=cvenvr
 VER=$(shell cat VERSION)
 
 all:
 
 install:
-	install -D mkcbundle $(DESTDIR)/usr/bin/mkcbundle
-	install -D cbundle $(DESTDIR)/usr/bin/cbundle
+	install -D mkcvenv $(DESTDIR)/usr/bin/mkcvenv
+	install -D cvenv $(DESTDIR)/usr/bin/cvenv
 
 dist:
 	mkdir $(PROJECT)-$(VER)
